@@ -1,8 +1,7 @@
 ﻿#include "TBC-Tools.h"
+#include "TBC-IVTC.h"
 
 #include <iostream>
-#include <string> 
-#include <cstdlib>
 #include <cstdio>
 #include <stdio.h>
 #include <fcntl.h>
@@ -17,9 +16,11 @@ using namespace rapidjson;
 
 #define TBC_TOOLS_NAME		"NebulousDev's TBC-Tools"
 #define TBC_TOOLS_GITHUB	"https://github.com/NebulousDev/TBC-Tools"
-#define TBC_TOOLS_VERSION	"alpha v0.2"
+#define TBC_TOOLS_VERSION	"alpha v0.3"
 
-#define TBC_MAX_FIELDS		10
+#define TBC_MAX_FIELDS		30
+
+#define TBC_OUTPUT_DEFAULT_POSTFIX	"_tbct"
 
 // Video input/output streams
 string		inputStreamPath;
@@ -42,14 +43,24 @@ Document	tbcJSONOut;
 Value*		pTbcFields;
 
 // Counters
-uint64_t	start			= 0;
-uint64_t	phase			= 0;
+uint32_t	fieldAccCount	= 0;
 uint64_t	fieldSqId		= 0;
 uint64_t	fieldSqNoIn		= 0;
 uint64_t	fieldSqNoOut	= 0;
 uint64_t	timeout			= 0;
 
-bool doTimeout = true;
+// Parameters
+uint64_t	start			= -1;
+uint64_t	phase			= 0;
+bool		doTimeout		= true;
+bool		doIVTC			= false;
+string		pulldown;
+
+// Set the number of fields to accumulate each proccessing period
+void set_field_accumulation(uint32_t fields)
+{
+	fieldAccCount = fields;
+}
 
 // Read fields from the input stream into input field buffers
 bool accumulate_fields(uint32_t count)
@@ -124,21 +135,6 @@ void route_field(uint32_t inputFieldIdx, uint32_t outputFieldIdx)
 	outputFieldCount++;
 }
 
-// Apply 2:3 pulldown on fields
-void pulldown_fields_2_3(uint32_t phase)
-{
-	// TODO: ensure inputFieldCount count is 10?
-
-	route_field((phase + 0) % 10, 0); // A1
-	route_field((phase + 1) % 10, 1); // A2
-	route_field((phase + 3) % 10, 2); // B1
-	route_field((phase + 4) % 10, 3); // B2
-	route_field((phase + 6) % 10, 4); // C1
-	route_field((phase + 7) % 10, 5); // C2
-	route_field((phase + 8) % 10, 6); // D1
-	route_field((phase + 9) % 10, 7); // D2
-}
-
 // Copy extra unprocessed fields to the output buffers
 void copy_remaining_fields()
 {
@@ -149,10 +145,12 @@ void copy_remaining_fields()
 }
 
 // Process command line arguments
-//   -s: set starting field
-//   -i: set input stream
-//   -o: set output stream
-//   -j: set input tbc.json file
+//   -ivtc [str]: enable ivtc with pulldown (ex. "3:2" or "4:2")
+//   -s    [int]: set starting field
+//   -i    [str]: set input stream
+//   -o    [str]: set output stream
+//   -j    [str]: set input tbc.json file
+//   -jo   [str]: set output tbc.json file
 bool process_opts(int argc, char* argv[])
 {
 	cerr << "[TBC-Tools] Processing with arguments: ";
@@ -160,7 +158,7 @@ bool process_opts(int argc, char* argv[])
 	{
 		if (i + 1 < argc)
 		{
-			cerr << "[" << argv[i] << " " << argv[i + 1] << "], ";
+			cerr << "[" << argv[i] << " " << argv[i + 1] << "] ";
 		}
 	}
 
@@ -168,6 +166,21 @@ bool process_opts(int argc, char* argv[])
 
 	for (uint32_t i = 1; i < argc; i++)
 	{
+		if (strcmp(argv[i], "-ivtc") == 0)
+		{
+			if (i + 1 <= argc)
+			{
+				doIVTC = true;
+				pulldown = argv[i + 1];
+				i++;
+			}
+			else
+			{
+				// TODO: Error message
+				return false;
+			}
+		}
+
 		if (strcmp(argv[i], "-s") == 0)
 		{
 			if (i + 1 <= argc)
@@ -201,6 +214,8 @@ bool process_opts(int argc, char* argv[])
 			if (i + 1 <= argc)
 			{
 				outputStreamPath = argv[i + 1];
+				tbcJSONpathOut = outputStreamPath;
+				tbcJSONpathOut.append(".json");
 				i++;
 			}
 			else
@@ -215,9 +230,20 @@ bool process_opts(int argc, char* argv[])
 			if (i + 1 <= argc)
 			{
 				tbcJSONpathIn = argv[i + 1];
-				tbcJSONpathOut = tbcJSONpathIn;
-				tbcJSONpathOut.replace(tbcJSONpathOut.end() - 9,
-					tbcJSONpathOut.end(), "_ivtc.tbc.json");
+				i++;
+			}
+			else
+			{
+				// TODO: Error message
+				return false;
+			}
+		}
+
+		else if (strcmp(argv[i], "-jo") == 0)
+		{
+			if (i + 1 <= argc)
+			{
+				tbcJSONpathOut = argv[i + 1];
 				i++;
 			}
 			else
@@ -341,8 +367,6 @@ bool open_streams()
 {
 	int result = 0;
 
-	cerr << "[TBC - Tools] Starting." << endl;
-
 	if (strcmp(inputStreamPath.c_str(), "-") == 0)
 	{
 		fpInputStream = stdin;
@@ -419,14 +443,93 @@ void delete_buffers()
 	}
 }
 
+// Ensure defaults are reasonable
+bool check_setup()
+{
+	if (inputStreamPath.empty())
+	{
+		cerr << "[TBC-Tools] No input tbc file or stream specified. Use -i [filepath / - ]." << endl;
+		return false;
+	}
+	if (outputStreamPath.empty())
+	{
+		outputStreamPath = inputStreamPath;
+		outputStreamPath.replace(outputStreamPath.end() - 4, outputStreamPath.end(), TBC_OUTPUT_DEFAULT_POSTFIX ".tbc");
+
+		cerr << "[TBC-Tools] No output tbc file or stream specified. Use -o [filepath / - ]. Assuming ["
+			<< outputStreamPath.c_str() << "]." << endl;
+	}
+	if (tbcJSONpathIn.empty())
+	{
+		tbcJSONpathIn = inputStreamPath;
+		tbcJSONpathIn.append(".json");
+
+		cerr << "[TBC-Tools] No input tbc.json file specified. Use -j [filepath]. Assuming ["
+			<< tbcJSONpathIn.c_str() << "]." << endl;
+	}
+	if (tbcJSONpathOut.empty())
+	{
+		tbcJSONpathOut = outputStreamPath;
+		tbcJSONpathOut.append(".json");
+
+		cerr << "[TBC-Tools] No output tbc.json file specified. Use -jo [filepath]. Assuming ["
+			<< tbcJSONpathOut.c_str() << "]." << endl;
+	}
+	if (pulldown.empty())	// Currently the only process, so required field for now.
+	{
+		pulldown = "3:2";
+		doIVTC = true;
+		cerr << "[TBC-Tools] No ivtc pulldown specified. Use -ivtc [mode ex. \"3:2\"]. Assuming ["
+			<< pulldown.c_str() << "]." << endl;
+	}
+	if (start == -1)
+	{
+		start = 0;
+		cerr << "[TBC-Tools] No starting field specified. Results may not be correct. Use -s [int]. Assuming ["
+			<< to_string(start) << "]." << endl;
+	}
+
+	return true;
+}
+
+#define DO_TEST 0
+#define TEST_NUM "0"
+
 int main(int argc, char* argv[])
 {
+#if DO_TEST
+	
+	// test0: -ivtc ?, -s 3?
+	// test1: -ivtc 3:2, -s 9
+
+	const char* testArgs[7];
+	testArgs[0 ] = "TBC-Tools.exe";
+	testArgs[1 ] = "-ivtc";
+	testArgs[2 ] = "3:3:4"; 
+	testArgs[3 ] = "-s";
+	testArgs[4 ] = "9"; 
+	testArgs[5 ] = "-i";
+	testArgs[6 ] = PROJECT_SRC_DIR "/tbcs/test" TEST_NUM ".tbc";
+
+	argc = sizeof(testArgs) / sizeof(char*);
+	argv = const_cast<char**>(testArgs);
+
+#endif
+
 	int result = 0;
 
+	cerr << "[TBC-Tools] Starting." << endl;
+
 	if (!process_opts(argc, argv)) { return 1; }
+	if (!check_setup()) { return 1; }
 	if (!init_buffers()) { return 1; }
 	if (!open_streams()) { return 1; }
 	if (!load_json()) { return 1; }
+
+	if (doIVTC)
+	{
+		setup_pulldown(pulldown);
+	}
 
 	// Align field processing with starting field
 	if (true)
@@ -436,22 +539,25 @@ int main(int argc, char* argv[])
 
 		if (!write_fields())
 		{
-			// error
+			// TODO: error
 		}
 	}
 
 	// Process fields
 	while (true)
 	{
-		if (accumulate_fields(10)) // Temp number for 3:2 pulldown
+		if (accumulate_fields(fieldAccCount))
 		{
 			// Normal accumulation, process fields
 
-			pulldown_fields_2_3(phase);
+			if (doIVTC)
+			{
+				pulldown_fields(phase);
+			}
 
 			if (!write_fields())
 			{
-				break; // error
+				break; // TODO: error
 			}
 		}
 		else
@@ -462,7 +568,7 @@ int main(int argc, char* argv[])
 
 			if (!write_fields())
 			{
-				break; // error
+				break; // TODO: error
 			}
 
 			break;
@@ -471,10 +577,16 @@ int main(int argc, char* argv[])
 
 	if (!save_json()) { return 1; }
 
-	cerr << "[TBC - Tools] Processing complete." << endl;
+	cerr << "[TBC-Tools] Processing complete." << endl;
 
 	close_streams();
 	delete_buffers();
+
+#if DO_TEST
+
+	system("ld-analyse.exe " PROJECT_SRC_DIR "/tbcs/test" TEST_NUM "_tbct.tbc");
+
+#endif
 
 	return 0;
 }
