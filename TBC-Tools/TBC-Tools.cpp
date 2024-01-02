@@ -4,7 +4,6 @@
 #include <string> 
 #include <cstdlib>
 #include <cstdio>
-
 #include <stdio.h>
 #include <fcntl.h>
 #include <io.h>
@@ -16,17 +15,24 @@
 using namespace std;
 using namespace rapidjson;
 
-#define TBC_TOOLS_NAME		"Nebulous39's TBC-Tools"
-#define TBC_TOOLS_GITHUB	"..."
-#define TBC_TOOLS_VERSION	"alpha v0.1"
+#define TBC_TOOLS_NAME		"NebulousDev's TBC-Tools"
+#define TBC_TOOLS_GITHUB	"https://github.com/NebulousDev/TBC-Tools"
+#define TBC_TOOLS_VERSION	"alpha v0.2"
+
+#define TBC_MAX_FIELDS		10
 
 // Video input/output streams
-FILE* ffmpegPipeIn		= stdin;
-FILE* ffmpegPipeOut		= stdout;
+string		inputStreamPath;
+string		outputStreamPath;
+FILE*		fpInputStream	= nullptr;
+FILE*		fpOutputStream	= nullptr;
 
 // Raw TBC Buffers (default 910x263)
-uint16_t* pPipeBuffer	= nullptr;	
-uint16_t* pField[2]		= { nullptr, nullptr };
+uint16_t*	pPipeBuffer						= nullptr;
+uint16_t*	pFields[TBC_MAX_FIELDS]			= {};
+uint16_t	fieldIdxs[TBC_MAX_FIELDS * 2]	= {};
+uint32_t	inputFieldCount					= 0;
+uint32_t	outputFieldCount				= 0;
 
 // Example.tbc.json files
 string		tbcJSONpathIn;
@@ -36,58 +42,197 @@ Document	tbcJSONOut;
 Value*		pTbcFields;
 
 // Counters
-uint64_t start			= 0;
-uint64_t totalFrames	= 0;
-uint64_t frame			= 0;
-uint64_t fieldHalf		= 0;
-uint64_t fieldSqNoIn	= 0;
-uint64_t fieldSqNoOut	= 0;
-uint64_t timeout		= 0;
+uint64_t	start			= 0;
+uint64_t	phase			= 0;
+uint64_t	fieldSqId		= 0;
+uint64_t	fieldSqNoIn		= 0;
+uint64_t	fieldSqNoOut	= 0;
+uint64_t	timeout			= 0;
 
 bool doTimeout = true;
 
-void process_field()
+// Read fields from the input stream into input field buffers
+bool accumulate_fields(uint32_t count)
 {
-	if (fieldHalf == 1)
-	{
-		// Write tbc data
+	uint64_t bytesRead = 0;
+	uint32_t fields = 0;
 
-		fwrite(pField[0], sizeof(uint16_t), 263 * 910, ffmpegPipeOut);
-		fwrite(pField[1], sizeof(uint16_t), 263 * 910, ffmpegPipeOut);
-		fwrite(pField[0], sizeof(uint16_t), 263 * 910, ffmpegPipeOut);
-		fwrite(pField[1], sizeof(uint16_t), 263 * 910, ffmpegPipeOut);
+	inputFieldCount = 0;
+
+	while (fields < count)
+	{
+		if (doTimeout && timeout > 250000)
+		{ 
+			return false; // timed out
+		} 
+
+		pPipeBuffer = pFields[fields];
+		bytesRead = fread(pPipeBuffer, sizeof(uint16_t), 263 * 910, fpInputStream);
+
+		if (bytesRead > 0)
+		{
+			inputFieldCount++;
+			fieldSqNoIn++;
+			fields++;
+
+			timeout = 0;
+		}
+		else
+		{
+			timeout++;
+		}
+	}
+
+	return true;
+}
+
+// Write processed fields to output stream and tbc.json buffer
+bool write_fields()
+{
+	uint64_t bytesWritten = 0;
+	Value& fields = tbcJSONIn["fields"];
+
+	for (uint32_t i = 0; i < outputFieldCount; i++)
+	{
+		// Write video data
+
+		uint32_t fieldIdx = fieldIdxs[i];
+		bytesWritten = fwrite(pFields[fieldIdx], sizeof(uint16_t), 263 * 910, fpOutputStream); // TODO: Check for errors
 
 		// Write json data
 
-		Value& fields = tbcJSONIn["fields"];
+		fieldSqNoOut++;
 
-		uint64_t fieldSq = fieldSqNoIn - (fieldSqNoIn % 2);
+		Value field;
+		uint32_t jsonFieldIdx = ((fieldSqNoIn - inputFieldCount) + fieldIdx);
+		field.CopyFrom(fields[jsonFieldIdx], tbcJSONOut.GetAllocator());
+		field["seqNo"].Set(fieldSqNoOut);
 
-		Value field0; field0.CopyFrom(fields[fieldSq + 0], tbcJSONOut.GetAllocator());
-		Value field1; field1.CopyFrom(fields[fieldSq + 1], tbcJSONOut.GetAllocator());
-		Value field2; field2.CopyFrom(fields[fieldSq + 0], tbcJSONOut.GetAllocator());
-		Value field3; field3.CopyFrom(fields[fieldSq + 1], tbcJSONOut.GetAllocator());
-
-		field0["seqNo"].Set(fieldSqNoOut + 0);
-		field1["seqNo"].Set(fieldSqNoOut + 1);
-		field2["seqNo"].Set(fieldSqNoOut + 2);
-		field3["seqNo"].Set(fieldSqNoOut + 3);
-
-		pTbcFields->PushBack(field0, tbcJSONOut.GetAllocator());
-		pTbcFields->PushBack(field1, tbcJSONOut.GetAllocator());
-		pTbcFields->PushBack(field2, tbcJSONOut.GetAllocator());
-		pTbcFields->PushBack(field3, tbcJSONOut.GetAllocator());
-		
-		fieldSqNoOut += 4;
-		frame++;
+		pTbcFields->PushBack(field, tbcJSONOut.GetAllocator());
 	}
 
-	fieldSqNoIn++;
-	fieldHalf = (fieldHalf + 1) % 2;
-	pPipeBuffer = pField[fieldHalf];
+	outputFieldCount = 0;
+
+	return true;
 }
 
-int loadJSON(const char* filepath)
+// Route a field from the input field buffer to output field buffer (by index)
+void route_field(uint32_t inputFieldIdx, uint32_t outputFieldIdx)
+{
+	// TODO: Bounds checking
+	fieldIdxs[outputFieldIdx] = inputFieldIdx;
+	outputFieldCount++;
+}
+
+// Apply 2:3 pulldown on fields
+void pulldown_fields_2_3(uint32_t phase)
+{
+	// TODO: ensure inputFieldCount count is 10?
+
+	route_field((phase + 0) % 10, 0); // A1
+	route_field((phase + 1) % 10, 1); // A2
+	route_field((phase + 3) % 10, 2); // B1
+	route_field((phase + 4) % 10, 3); // B2
+	route_field((phase + 6) % 10, 4); // C1
+	route_field((phase + 7) % 10, 5); // C2
+	route_field((phase + 8) % 10, 6); // D1
+	route_field((phase + 9) % 10, 7); // D2
+}
+
+// Copy extra unprocessed fields to the output buffers
+void copy_remaining_fields()
+{
+	for (uint32_t i = 0; i < inputFieldCount; i++)
+	{
+		route_field(i, i);
+	}
+}
+
+// Process command line arguments
+//   -s: set starting field
+//   -i: set input stream
+//   -o: set output stream
+//   -j: set input tbc.json file
+bool process_opts(int argc, char* argv[])
+{
+	cerr << "[TBC-Tools] Processing with arguments: ";
+	for (uint32_t i = 1; i < argc; i += 2)
+	{
+		if (i + 1 < argc)
+		{
+			cerr << "[" << argv[i] << " " << argv[i + 1] << "], ";
+		}
+	}
+
+	cerr << endl;
+
+	for (uint32_t i = 1; i < argc; i++)
+	{
+		if (strcmp(argv[i], "-s") == 0)
+		{
+			if (i + 1 <= argc)
+			{
+				start = atoi(argv[i + 1]);
+				i++;
+			}
+			else
+			{
+				// TODO: Error message
+				return false;
+			}
+		}
+
+		else if (strcmp(argv[i], "-i") == 0)
+		{
+			if (i + 1 <= argc)
+			{
+				inputStreamPath = argv[i + 1];
+				i++;
+			}
+			else
+			{
+				// TODO: Error message
+				return false;
+			}
+		}
+
+		else if (strcmp(argv[i], "-o") == 0)
+		{
+			if (i + 1 <= argc)
+			{
+				outputStreamPath = argv[i + 1];
+				i++;
+			}
+			else
+			{
+				// TODO: Error message
+				return false;
+			}
+		}
+
+		else if (strcmp(argv[i], "-j") == 0)
+		{
+			if (i + 1 <= argc)
+			{
+				tbcJSONpathIn = argv[i + 1];
+				tbcJSONpathOut = tbcJSONpathIn;
+				tbcJSONpathOut.replace(tbcJSONpathOut.end() - 9,
+					tbcJSONpathOut.end(), "_ivtc.tbc.json");
+				i++;
+			}
+			else
+			{
+				// TODO: Error message
+				return false;
+			}
+		}
+	}
+
+	return true;
+}
+
+// Load original tbc.json file
+int load_json()
 {
 	char* pJsonBufferIn	= nullptr;
 	FILE* jsonFileIn	= nullptr;
@@ -97,14 +242,26 @@ int loadJSON(const char* filepath)
 
 	// Load tbc.json file as a string
 
-	result = fopen_s(&jsonFileIn, filepath, "r");
-	if (result == -1 || !jsonFileIn) { return -1; } // file error
+	result = fopen_s(&jsonFileIn, tbcJSONpathIn.c_str(), "r");
+	if (result == -1 || !jsonFileIn)
+	{ 
+		cerr << "[TBC-Tools] Could not load tbc.json file [" << tbcJSONpathIn.c_str() << "]. File not found, or is unreadable." << endl;
+		return false;
+	} 
 
 	result = fseek(jsonFileIn, 0L, SEEK_END);
-	if (result != 0) { return -1; } // seek error
+	if (result != 0)
+	{
+		cerr << "[TBC-Tools] Could not load tbc.json file [" << tbcJSONpathIn.c_str() << "]. Seek failed." << endl;
+		return false;
+	}
 
 	bufferSize = ftell(jsonFileIn);
-	if (bufferSize == -1) { return -1; } // error
+	if (bufferSize == -1)
+	{
+		cerr << "[TBC-Tools] Could not load tbc.json file [" << tbcJSONpathIn.c_str() << "]. Could not determine file size." << endl;
+		return false;
+	}
 
 	pJsonBufferIn = new char[bufferSize + 1] {};
 
@@ -127,10 +284,6 @@ int loadJSON(const char* filepath)
 	tbcJSONOut.AddMember("pcmAudioParameters", tbcJSONIn["pcmAudioParameters"], tbcJSONOut.GetAllocator());
 	tbcJSONOut.AddMember("videoParameters", tbcJSONIn["videoParameters"], tbcJSONOut.GetAllocator());
 
-	totalFrames = tbcJSONOut["videoParameters"]["numberOfSequentialFields"].GetInt64();
-	tbcJSONOut["videoParameters"]["numberOfSequentialFields"].Set(totalFrames * 2);
-	
-
 	Value tbcTools;
 	tbcTools.SetObject();
 	tbcTools.AddMember("name", Value(TBC_TOOLS_NAME), tbcJSONOut.GetAllocator());
@@ -149,178 +302,179 @@ int loadJSON(const char* filepath)
 	fclose(jsonFileIn);
 	delete[] pJsonBufferIn;
 
-	return 0;
+	return true;
 }
 
-int saveJSON(const char* filepath)
+// Save new tbc.json file
+bool save_json()
 {
 	FILE* jsonFileOut	= nullptr;
 	long bytesWritten	= 0;
 	int result			= 0;
 
-	result = fopen_s(&jsonFileOut, filepath, "w");
-	if (result == -1 || !jsonFileOut) { return -1; } // file error
+	cerr << "[TBC-Tools] Saving tbc.json [" << tbcJSONpathOut.c_str() << "]." << endl;
+
+	// Set final field count
+	tbcJSONOut["videoParameters"]["numberOfSequentialFields"].Set(fieldSqNoOut);
+
+	result = fopen_s(&jsonFileOut, tbcJSONpathOut.c_str(), "w");
+	if (result == -1 || !jsonFileOut)
+	{
+		cerr << "[TBC-Tools] Could not write tbc.json file [" << tbcJSONpathOut.c_str() << "]." << endl;
+		return false;
+	} 
 
 	StringBuffer jsonBufferOut;
 	Writer<StringBuffer> writer(jsonBufferOut);
 	tbcJSONOut.Accept(writer);
 
 	bytesWritten = fwrite(jsonBufferOut.GetString(), sizeof(char), jsonBufferOut.GetSize(), jsonFileOut);
-	if (bytesWritten == 0) { return -1; } // write error
+	if (bytesWritten == 0) { return false; } // write error
 
 	fclose(jsonFileOut);
 
-	return 0;
+	return true;
 }
 
-int process_opts(int argc, char* argv[])
+// Open video input and output streams
+bool open_streams()
 {
-	for (unsigned int i = 1; i < argc; i++)
+	int result = 0;
+
+	cerr << "[TBC - Tools] Starting." << endl;
+
+	if (strcmp(inputStreamPath.c_str(), "-") == 0)
 	{
-		if (strcmp(argv[i], "-s"))
+		fpInputStream = stdin;
+
+		result = _setmode(_fileno(stdin), _O_BINARY);
+		if (result == -1)
 		{
-			if (i + 1 <= argc)
-			{
-				start = atoi(argv[i + 1]);
-				i++;
-			}
-			else
-			{
-				// error
-			}
+			cerr << "[TBC-Tools] Failed to set stdin mode to binary." << endl;
+			return false;
 		}
+	}
+	else
+	{
+		result = fopen_s(&fpInputStream, inputStreamPath.c_str(), "rb");
 
-		else if (strcmp(argv[i], "-i"))
+		if (result == -1 || !fpInputStream)
+		{ 
+			cerr << "[TBC-Tools] Failed to open input stream [" << inputStreamPath.c_str() << "." << endl;
+			return false;
+		} 
+	}
+
+	if (strcmp(outputStreamPath.c_str(), "-") == 0)
+	{
+		fpOutputStream = stdout;
+
+		result = _setmode(_fileno(stdout), _O_BINARY);
+		if (result == -1)
 		{
-			if (i + 1 <= argc)
-			{
-				if (!strcmp(argv[i + 1], "-"))
-				{
-					ffmpegPipeIn = fopen(argv[i + 1], "rb");
-					doTimeout = false;
-				}
-
-				i++;
-			}
-			else
-			{
-				// error
-			}
+			cerr << "[TBC-Tools] Failed to set stdout mode to binary." << endl;
+			return false;
 		}
+	}
+	else
+	{
+		result = fopen_s(&fpOutputStream, outputStreamPath.c_str(), "wb");
 
-		else if (strcmp(argv[i], "-o"))
-		{
-			if (i + 1 <= argc)
-			{
-				if (!strcmp(argv[i + 1], "-"))
-				{
-					ffmpegPipeOut = fopen(argv[i + 1], "wb");
-				}
-
-				i++;
-			}
-			else
-			{
-				// error
-			}
-		}
-
-		else if (strcmp(argv[i], "-j"))
-		{
-			if (i + 1 <= argc)
-			{
-				tbcJSONpathIn = argv[i + 1];
-			}
-			else
-			{
-				// error
-			}
+		if (result == -1 || !fpOutputStream)
+		{ 
+			cerr << "[TBC-Tools] Failed to open output stream [" << outputStreamPath.c_str() << "." << endl;
+			return false;
 		}
 	}
 
-	return 0;
+	return true;
+}
+
+// Close video input and output streams
+void close_streams()
+{
+	if (fpInputStream) fclose(fpInputStream);
+	if (fpOutputStream) fclose(fpOutputStream);
+}
+
+// Create field buffers
+bool init_buffers()
+{
+	for (uint32_t i = 0; i < TBC_MAX_FIELDS; i++)
+	{
+		pFields[i] = new uint16_t[263 * 910]{};
+	}
+
+	pPipeBuffer = pFields[0];
+
+	return true;
+}
+
+// Delete field buffers
+void delete_buffers()
+{
+	for (uint32_t i = 0; i < TBC_MAX_FIELDS; i++)
+	{
+		delete[] pFields[i];
+	}
 }
 
 int main(int argc, char* argv[])
 {
-	pField[0] = new uint16_t[263 * 910]{};
-	pField[1] = new uint16_t[263 * 910]{};
-	pPipeBuffer = pField[0];
-
 	int result = 0;
 
-	if (process_opts(argc, argv))
-	{
-		return 0;
-	}
+	if (!process_opts(argc, argv)) { return 1; }
+	if (!init_buffers()) { return 1; }
+	if (!open_streams()) { return 1; }
+	if (!load_json()) { return 1; }
 
-	if (ffmpegPipeIn == stdin)
+	// Align field processing with starting field
+	if (true)
 	{
-		result = _setmode(_fileno(stdin), _O_BINARY);
-		if (result == -1)
+		accumulate_fields(start);
+		copy_remaining_fields();
+
+		if (!write_fields())
 		{
-			cout << "[TBC-IVTC] Could not set stdin mode to binary. Exiting." << endl;
-			return 1;
+			// error
 		}
 	}
 
-	if (ffmpegPipeOut == stdout)
+	// Process fields
+	while (true)
 	{
-		result = _setmode(_fileno(stdout), _O_BINARY);
-		if (result == -1)
+		if (accumulate_fields(10)) // Temp number for 3:2 pulldown
 		{
-			cout << "[TBC-IVTC] Could not set stdout mode to binary. Exiting." << endl;
-			return 1;
-		}
-	}
+			// Normal accumulation, process fields
 
-#if 0
-	{
-		ffmpegPipeIn = _popen("ffmpeg -f rawvideo -video_size 910x263 -pix_fmt gray16 -i \"R:\\Ingest 2\\Record of Lodess War\\Record of Lodess War Deedlit.tbc\" -c:v rawvideo -f rawvideo -", "rb");
-		ffmpegPipeOut = _popen("ffmpeg -f rawvideo -video_size 910x263 -pix_fmt gray16 -i - -c:v rawvideo -y -f rawvideo \"R:\\Ingest 2\\Record of Lodess War\\Record of Lodess War Deedlit_ivtc.tbc\"", "wb");
-		tbcJSONpath = "R:\\Ingest 2\\Record of Lodess War\\Record of Lodess War Deedlit.tbc.json";
-	}
-#endif
+			pulldown_fields_2_3(phase);
 
-#if 1
-	{
-		ffmpegPipeIn = _popen("ffmpeg -f rawvideo -video_size 910x263 -pix_fmt gray16 -i \"R:\\Ingest 2\\Record of Lodess War\\Record of Lodoss War OP 3-Stack.tbc\" -c:v rawvideo -f rawvideo -", "rb");
-		ffmpegPipeOut = _popen("ffmpeg -f rawvideo -video_size 910x263 -pix_fmt gray16 -i - -c:v rawvideo -y -f rawvideo \"R:\\Ingest 2\\Record of Lodess War\\Record of Lodoss War OP 3-Stack_ivtc.tbc\"", "wb");
-		tbcJSONpathIn = "R:\\Ingest 2\\Record of Lodess War\\Record of Lodoss War OP 3-Stack.tbc.json";
-		tbcJSONpathOut = "R:\\Ingest 2\\Record of Lodess War\\Record of Lodoss War OP 3-Stack_ivtc.tbc.json";
-	}
-#endif
-
-	result = loadJSON(tbcJSONpathIn.c_str());
-	if (result == -1)
-	{
-		cout << "[TBC-IVTC] Could not load tbc.json file. Exiting." << endl;
-		return 1;
-	}
-
-	while (frame < totalFrames - 4)
-	{
-		if (doTimeout && timeout > 2500000) { break; }
-
-		size_t read = fread(pPipeBuffer, sizeof(uint16_t), 263 * 910, ffmpegPipeIn);
-
-		if (read > 0)
-		{
-			process_field();
-			timeout = 0;
+			if (!write_fields())
+			{
+				break; // error
+			}
 		}
 		else
 		{
-			timeout++;
+			// End of stream or error
+
+			copy_remaining_fields();
+
+			if (!write_fields())
+			{
+				break; // error
+			}
+
+			break;
 		}
 	}
 
-	result = saveJSON(tbcJSONpathOut.c_str());
-	if (result == -1)
-	{
-		cout << "[TBC-IVTC] Could not write tbc.json file. Exiting." << endl;
-		return 1;
-	}
+	if (!save_json()) { return 1; }
+
+	cerr << "[TBC - Tools] Processing complete." << endl;
+
+	close_streams();
+	delete_buffers();
 
 	return 0;
 }
